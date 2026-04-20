@@ -3443,6 +3443,7 @@ name = "time-locked-vault"
 version = "0.1.0"
 dependencies = [
  "litesvm",
+ "serde_json",
  "solana-account",
  "solana-instruction",
  "solana-keypair",

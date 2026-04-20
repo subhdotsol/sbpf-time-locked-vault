@@ -49,6 +49,16 @@
 
 .globl entrypoint
 entrypoint:
+    ; Debug: log r1 (input buffer) and first few bytes
+    mov64 r5, r1
+    ldxdw r1, [r5 + 0x00]   ; num_accounts
+    mov64 r2, 0x1111        ; marker
+    mov64 r3, 0x2222        ; marker
+    mov64 r4, 0x3333        ; marker
+    call sol_log_64_
+
+    ; Restore r1 from r5 (which was original r1)
+    mov64 r1, r5
     ; Save input buffer ptr in r9 (callee-saved, survives syscalls)
     mov64 r9, r1
 
@@ -91,7 +101,6 @@ initialize:
 
     mov64 r0, 0
     exit
-
 
 ; WITHDRAW
 ; Accounts: [0]=vault PDA, [1]=user (signer), [2]=clock sysvar, [3]=destination

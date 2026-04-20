@@ -52,18 +52,20 @@ mod tests {
     // Returns (svm, program_id, fee_payer_keypair).
 
     fn setup() -> (LiteSVM, Pubkey, Keypair) {
-        let program_id_bytes: [u8; 32] = std::fs::read("deploy/time-locked-vault-keypair.json")
-            .unwrap()[..32]
-            .try_into()
-            .expect("keypair file too short");
-
-        let program_id = Pubkey::from(program_id_bytes);
+        let secret_key: Vec<u8> = serde_json::from_str(
+            &std::fs::read_to_string("deploy/time-locked-vault-keypair.json").unwrap(),
+        )
+        .unwrap();
+        let program_keypair = Keypair::new_from_array(secret_key[..32].try_into().unwrap());
+        let program_id = program_keypair.pubkey();
 
         let elf = std::fs::read("deploy/time-locked-vault.so")
             .expect("build the program first with `sbpf build`");
 
         let mut svm = LiteSVM::new();
-        svm.add_program(program_id, &elf);
+        if let Err(e) = svm.add_program(program_id, &elf) {
+            panic!("Failed to add program {}: {:?}", program_id, e);
+        }
 
         // A funded payer to sign every transaction
         let payer = Keypair::new();
