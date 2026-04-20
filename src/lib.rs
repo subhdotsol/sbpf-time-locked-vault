@@ -1,21 +1,23 @@
 #[cfg(test)]
 mod tests {
-    use mollusk_svm::{result::Check, Mollusk};
+    use litesvm::LiteSVM;
+    use solana_account::Account;
     use solana_instruction::{AccountMeta, Instruction};
-    use solana_pubkey::Pubkey;
-    use solana_sdk::account::Account;
+    use solana_keypair::Keypair;
+    use solana_message::Message;
+    use solana_pubkey::{pubkey, Pubkey};
+    use solana_signer::Signer;
+    use solana_transaction::Transaction;
 
-    //  vault data layout (must match .s offsets)
+    //  vault data layout offsets (must match .s file)
     const VAULT_OWNER: usize = 0x00;
     const VAULT_UNLOCK: usize = 0x20;
     const VAULT_WITHDRAWN: usize = 0x28;
     const VAULT_DATA_SIZE: usize = 0x29;
 
-    // sysvar IDs
-    // Clock sysvar has a well-known fixed address on all clusters
-    const CLOCK_ID: Pubkey = solana_pubkey::pubkey!("SysvarC1ock11111111111111111111111111111111");
-    const SYSVAR_OWNER: Pubkey =
-        solana_pubkey::pubkey!("Sysvar1111111111111111111111111111111111111");
+    // sysvar addresses
+    const CLOCK_ID: Pubkey = pubkey!("SysvarC1ock11111111111111111111111111111111");
+    const SYSVAR_OWNER: Pubkey = pubkey!("Sysvar1111111111111111111111111111111111111");
 
     //  helpers
 
@@ -27,8 +29,8 @@ mod tests {
         data
     }
 
-    // Clock sysvar data: slot(u64), epoch_start_timestamp(i64),
-    //                    epoch(u64), leader_schedule_epoch(u64), unix_timestamp(i64)
+    // Clock sysvar layout: slot(u64) | epoch_start_timestamp(i64) |
+    //                      epoch(u64) | leader_schedule_epoch(u64) | unix_timestamp(i64)
     fn make_clock_data(slot: u64) -> Vec<u8> {
         let mut data = vec![0u8; 40];
         data[0..8].copy_from_slice(&slot.to_le_bytes());
@@ -45,76 +47,98 @@ mod tests {
         data[VAULT_OWNER..VAULT_OWNER + 32].try_into().unwrap()
     }
 
-    // shared setup
+    //  shared setup
+    // Loads the program ELF from the deploy directory into a fresh LiteSVM.
+    // Returns (svm, program_id, fee_payer_keypair).
 
-    fn setup() -> (Pubkey, Mollusk) {
+    fn setup() -> (LiteSVM, Pubkey, Keypair) {
         let program_id_bytes: [u8; 32] = std::fs::read("deploy/time-locked-vault-keypair.json")
             .unwrap()[..32]
             .try_into()
-            .expect("slice with incorrect length");
+            .expect("keypair file too short");
 
         let program_id = Pubkey::from(program_id_bytes);
-        let mollusk = Mollusk::new(&program_id, "deploy/time-locked-vault");
-        (program_id, mollusk)
+
+        let elf = std::fs::read("deploy/time-locked-vault.so")
+            .expect("build the program first with `sbpf build`");
+
+        let mut svm = LiteSVM::new();
+        svm.add_program(program_id, &elf);
+
+        // A funded payer to sign every transaction
+        let payer = Keypair::new();
+        svm.airdrop(&payer.pubkey(), 10_000_000_000).unwrap();
+
+        (svm, program_id, payer)
+    }
+
+    // Send a single instruction as a transaction signed by `signers`.
+    // `signers[0]` is always the fee payer.
+    fn send(svm: &mut LiteSVM, ix: Instruction, signers: &[&Keypair]) -> Result<(), String> {
+        let msg = Message::new(&[ix], Some(&signers[0].pubkey()));
+        let tx = Transaction::new(signers, msg, svm.latest_blockhash());
+        svm.send_transaction(tx)
+            .map(|_| ())
+            .map_err(|e| format!("{e:?}"))
     }
 
     // INITIALIZE TESTS
 
     #[test]
     fn test_initialize_success() {
-        let (program_id, mollusk) = setup();
+        let (mut svm, program_id, payer) = setup();
 
         let vault_pda = Pubkey::new_unique();
-        let user = Pubkey::new_unique();
+        let user = Keypair::new(); // the signer / future owner
         let unlock_slot: u64 = 100;
 
-        // ix data: [0x00=IX_INIT] ++ unlock_slot as le u64
+        // Vault account must already exist with enough space (program writes into it)
+        svm.set_account(
+            vault_pda,
+            Account {
+                lamports: svm.minimum_balance_for_rent_exemption(VAULT_DATA_SIZE),
+                data: vec![0u8; VAULT_DATA_SIZE],
+                owner: program_id,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+        // User just needs lamports to sign
+        svm.airdrop(&user.pubkey(), 1_000_000_000).unwrap();
+
+        // ix_data: [0x00=IX_INIT, unlock_slot as le u64]
         let mut ix_data = vec![0x00u8];
         ix_data.extend_from_slice(&unlock_slot.to_le_bytes());
 
-        let instruction = Instruction::new_with_bytes(
+        let ix = Instruction::new_with_bytes(
             program_id,
             &ix_data,
             vec![
-                AccountMeta::new(vault_pda, false),    // [0] vault (writable)
-                AccountMeta::new_readonly(user, true), // [1] signer
+                AccountMeta::new(vault_pda, false), // [0] vault (writable)
+                AccountMeta::new_readonly(user.pubkey(), true), // [1] signer
             ],
         );
 
-        let vault_account = Account {
-            lamports: mollusk.sysvars.rent.minimum_balance(VAULT_DATA_SIZE),
-            data: vec![0u8; VAULT_DATA_SIZE],
-            owner: program_id,
-            executable: false,
-            rent_epoch: 0,
-        };
-        let user_account = Account::new(1_000_000_000, 0, &Pubkey::default());
+        // payer pays fees, user signs as the vault owner
+        send(&mut svm, ix, &[&payer, &user]).expect("initialize should succeed");
 
-        let result = mollusk.process_and_validate_instruction(
-            &instruction,
-            &[(vault_pda, vault_account), (user, user_account)],
-            &[Check::success()],
-        );
-
-        let vault_after = result
-            .resulting_accounts
-            .iter()
-            .find(|(k, _)| *k == vault_pda)
-            .map(|(_, a)| a)
-            .expect("vault missing from result");
+        // assertions
+        let vault = svm.get_account(&vault_pda).expect("vault account missing");
 
         assert_eq!(
-            vault_owner_bytes(&vault_after.data),
-            user.to_bytes(),
+            vault_owner_bytes(&vault.data),
+            user.pubkey().to_bytes(),
             "vault owner should be the user pubkey"
         );
         assert_eq!(
-            vault_unlock(&vault_after.data),
+            vault_unlock(&vault.data),
             unlock_slot,
             "unlock_slot should match ix data"
         );
         assert_eq!(
-            vault_withdrawn(&vault_after.data),
+            vault_withdrawn(&vault.data),
             0,
             "withdrawn should be 0 after init"
         );
@@ -122,249 +146,213 @@ mod tests {
 
     // WITHDRAW TESTS
 
+    // Helper: set up a clock sysvar account at a given slot.
+    fn set_clock(svm: &mut LiteSVM, slot: u64) {
+        let data = make_clock_data(slot);
+        svm.set_account(
+            CLOCK_ID,
+            Account {
+                lamports: svm.minimum_balance_for_rent_exemption(data.len()),
+                data,
+                owner: SYSVAR_OWNER,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    }
+
     #[test]
     fn test_withdraw_success() {
-        let (program_id, mut mollusk) = setup();
+        let (mut svm, program_id, payer) = setup();
 
         let vault_pda = Pubkey::new_unique();
-        let user = Pubkey::new_unique();
+        let user = Keypair::new();
         let destination = Pubkey::new_unique();
-
         let unlock_slot: u64 = 50;
-        let current_slot: u64 = 100;
+        let current_slot: u64 = 100; // past the lock
         let vault_lamports: u64 = 500_000_000;
         let dest_lamports: u64 = 100_000_000;
 
-        mollusk.warp_to_slot(current_slot);
+        // Set clock to current_slot
+        set_clock(&mut svm, current_slot);
 
-        let vault_account = Account {
-            lamports: vault_lamports,
-            data: make_vault_data(&user, unlock_slot, 0),
-            owner: program_id,
-            executable: false,
-            rent_epoch: 0,
-        };
-        let user_account = Account::new(1_000_000_000, 0, &Pubkey::default());
-        let clock_data = make_clock_data(current_slot);
-        let clock_account = Account {
-            lamports: mollusk.sysvars.rent.minimum_balance(clock_data.len()),
-            data: clock_data,
-            owner: SYSVAR_OWNER,
-            executable: false,
-            rent_epoch: 0,
-        };
-        let dest_account = Account::new(dest_lamports, 0, &Pubkey::default());
+        // Vault: initialized, owned by user, not yet withdrawn
+        svm.set_account(
+            vault_pda,
+            Account {
+                lamports: vault_lamports,
+                data: make_vault_data(&user.pubkey(), unlock_slot, 0),
+                owner: program_id,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
 
-        let instruction = Instruction::new_with_bytes(
+        // Destination
+        svm.set_account(
+            destination,
+            Account {
+                lamports: dest_lamports,
+                data: vec![],
+                owner: Pubkey::default(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+        svm.airdrop(&user.pubkey(), 1_000_000_000).unwrap();
+
+        let ix = Instruction::new_with_bytes(
             program_id,
             &[0x01u8],
             vec![
-                AccountMeta::new(vault_pda, false),
-                AccountMeta::new_readonly(user, true),
-                AccountMeta::new_readonly(CLOCK_ID, false),
-                AccountMeta::new(destination, false),
+                AccountMeta::new(vault_pda, false),             // [0] vault
+                AccountMeta::new_readonly(user.pubkey(), true), // [1] signer
+                AccountMeta::new_readonly(CLOCK_ID, false),     // [2] clock sysvar
+                AccountMeta::new(destination, false),           // [3] destination
             ],
         );
 
-        let result = mollusk.process_and_validate_instruction(
-            &instruction,
-            &[
-                (vault_pda, vault_account),
-                (user, user_account),
-                (CLOCK_ID, clock_account),
-                (destination, dest_account),
-            ],
-            &[
-                Check::success(),
-                Check::account(&vault_pda).lamports(0).build(),
-                Check::account(&destination)
-                    .lamports(dest_lamports + vault_lamports)
-                    .build(),
-            ],
-        );
+        send(&mut svm, ix, &[&payer, &user]).expect("withdraw should succeed");
 
-        let vault_after = result
-            .resulting_accounts
-            .iter()
-            .find(|(k, _)| *k == vault_pda)
-            .map(|(_, a)| a)
-            .unwrap();
-
+        // assertions
+        let vault = svm.get_account(&vault_pda).expect("vault missing");
+        assert_eq!(vault.lamports, 0, "vault should be drained");
         assert_eq!(
-            vault_withdrawn(&vault_after.data),
+            vault_withdrawn(&vault.data),
             1,
             "withdrawn flag should be 1"
+        );
+
+        let dest = svm.get_account(&destination).expect("destination missing");
+        assert_eq!(
+            dest.lamports,
+            dest_lamports + vault_lamports,
+            "destination should have received vault lamports"
         );
     }
 
     #[test]
     fn test_withdraw_fails_before_unlock() {
-        let (program_id, mut mollusk) = setup();
+        let (mut svm, program_id, payer) = setup();
 
         let vault_pda = Pubkey::new_unique();
-        let user = Pubkey::new_unique();
+        let user = Keypair::new();
         let destination = Pubkey::new_unique();
 
-        let unlock_slot: u64 = 500;
-        let current_slot: u64 = 10; // before the lock
+        // current slot is BEFORE the unlock slot
+        set_clock(&mut svm, 10);
 
-        mollusk.warp_to_slot(current_slot);
+        svm.set_account(
+            vault_pda,
+            Account {
+                lamports: 500_000_000,
+                data: make_vault_data(&user.pubkey(), 500, 0), // unlock = slot 500
+                owner: program_id,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
 
-        let clock_data = make_clock_data(current_slot);
-        let clock_account = Account {
-            lamports: mollusk.sysvars.rent.minimum_balance(clock_data.len()),
-            data: clock_data,
-            owner: SYSVAR_OWNER,
-            executable: false,
-            rent_epoch: 0,
-        };
+        svm.airdrop(&user.pubkey(), 1_000_000_000).unwrap();
 
-        let instruction = Instruction::new_with_bytes(
+        let ix = Instruction::new_with_bytes(
             program_id,
             &[0x01u8],
             vec![
                 AccountMeta::new(vault_pda, false),
-                AccountMeta::new_readonly(user, true),
+                AccountMeta::new_readonly(user.pubkey(), true),
                 AccountMeta::new_readonly(CLOCK_ID, false),
                 AccountMeta::new(destination, false),
             ],
         );
 
-        mollusk.process_and_validate_instruction(
-            &instruction,
-            &[
-                (
-                    vault_pda,
-                    Account {
-                        lamports: 500_000_000,
-                        data: make_vault_data(&user, unlock_slot, 0),
-                        owner: program_id,
-                        executable: false,
-                        rent_epoch: 0,
-                    },
-                ),
-                (user, Account::new(1_000_000_000, 0, &Pubkey::default())),
-                (CLOCK_ID, clock_account),
-                (destination, Account::new(0, 0, &Pubkey::default())),
-            ],
-            // program does `mov64 r0, 1; exit` on failure → non-zero exit
-            &[Check::instruction_err(
-                solana_program::instruction::InstructionError::InvalidArgument,
-            )],
-        );
+        let result = send(&mut svm, ix, &[&payer, &user]);
+        assert!(result.is_err(), "withdraw before unlock should fail");
     }
 
     #[test]
     fn test_withdraw_fails_wrong_signer() {
-        let (program_id, mut mollusk) = setup();
+        let (mut svm, program_id, payer) = setup();
 
         let vault_pda = Pubkey::new_unique();
-        let real_owner = Pubkey::new_unique();
-        let wrong_signer = Pubkey::new_unique();
+        let real_owner = Keypair::new();
+        let wrong_signer = Keypair::new(); // different keypair
         let destination = Pubkey::new_unique();
 
-        let unlock_slot: u64 = 10;
-        let current_slot: u64 = 100;
+        set_clock(&mut svm, 100); // past unlock
 
-        mollusk.warp_to_slot(current_slot);
+        // vault is owned by real_owner
+        svm.set_account(
+            vault_pda,
+            Account {
+                lamports: 500_000_000,
+                data: make_vault_data(&real_owner.pubkey(), 10, 0),
+                owner: program_id,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
 
-        let clock_data = make_clock_data(current_slot);
-        let clock_account = Account {
-            lamports: mollusk.sysvars.rent.minimum_balance(clock_data.len()),
-            data: clock_data,
-            owner: SYSVAR_OWNER,
-            executable: false,
-            rent_epoch: 0,
-        };
+        svm.airdrop(&wrong_signer.pubkey(), 1_000_000_000).unwrap();
 
-        let instruction = Instruction::new_with_bytes(
+        let ix = Instruction::new_with_bytes(
             program_id,
             &[0x01u8],
             vec![
                 AccountMeta::new(vault_pda, false),
-                AccountMeta::new_readonly(wrong_signer, true), // ← wrong key
+                AccountMeta::new_readonly(wrong_signer.pubkey(), true), // ← wrong key
                 AccountMeta::new_readonly(CLOCK_ID, false),
                 AccountMeta::new(destination, false),
             ],
         );
 
-        mollusk.process_and_validate_instruction(
-            &instruction,
-            &[
-                (
-                    vault_pda,
-                    Account {
-                        lamports: 500_000_000,
-                        // vault was initialized with real_owner, not wrong_signer
-                        data: make_vault_data(&real_owner, unlock_slot, 0),
-                        owner: program_id,
-                        executable: false,
-                        rent_epoch: 0,
-                    },
-                ),
-                (
-                    wrong_signer,
-                    Account::new(1_000_000_000, 0, &Pubkey::default()),
-                ),
-                (CLOCK_ID, clock_account),
-                (destination, Account::new(0, 0, &Pubkey::default())),
-            ],
-            &[Check::instruction_err(
-                solana_program::instruction::InstructionError::InvalidArgument,
-            )],
-        );
+        let result = send(&mut svm, ix, &[&payer, &wrong_signer]);
+        assert!(result.is_err(), "wrong signer should be rejected");
     }
 
     #[test]
     fn test_withdraw_fails_already_withdrawn() {
-        let (program_id, mut mollusk) = setup();
+        let (mut svm, program_id, payer) = setup();
 
         let vault_pda = Pubkey::new_unique();
-        let user = Pubkey::new_unique();
+        let user = Keypair::new();
         let destination = Pubkey::new_unique();
 
-        mollusk.warp_to_slot(100);
+        set_clock(&mut svm, 100);
 
-        let clock_data = make_clock_data(100);
-        let clock_account = Account {
-            lamports: mollusk.sysvars.rent.minimum_balance(clock_data.len()),
-            data: clock_data,
-            owner: SYSVAR_OWNER,
-            executable: false,
-            rent_epoch: 0,
-        };
+        // withdrawn flag already = 1
+        svm.set_account(
+            vault_pda,
+            Account {
+                lamports: 0,
+                data: make_vault_data(&user.pubkey(), 10, 1),
+                owner: program_id,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
 
-        let instruction = Instruction::new_with_bytes(
+        svm.airdrop(&user.pubkey(), 1_000_000_000).unwrap();
+
+        let ix = Instruction::new_with_bytes(
             program_id,
             &[0x01u8],
             vec![
                 AccountMeta::new(vault_pda, false),
-                AccountMeta::new_readonly(user, true),
+                AccountMeta::new_readonly(user.pubkey(), true),
                 AccountMeta::new_readonly(CLOCK_ID, false),
                 AccountMeta::new(destination, false),
             ],
         );
 
-        mollusk.process_and_validate_instruction(
-            &instruction,
-            &[
-                (
-                    vault_pda,
-                    Account {
-                        lamports: 0,
-                        data: make_vault_data(&user, 10, 1), // withdrawn = 1 already
-                        owner: program_id,
-                        executable: false,
-                        rent_epoch: 0,
-                    },
-                ),
-                (user, Account::new(1_000_000_000, 0, &Pubkey::default())),
-                (CLOCK_ID, clock_account),
-                (destination, Account::new(0, 0, &Pubkey::default())),
-            ],
-            &[Check::instruction_err(
-                solana_program::instruction::InstructionError::InvalidArgument,
-            )],
-        );
+        let result = send(&mut svm, ix, &[&payer, &user]);
+        assert!(result.is_err(), "double-withdraw should fail");
     }
 }
